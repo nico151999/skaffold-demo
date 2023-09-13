@@ -1,0 +1,152 @@
+apiVersion: skaffold/v4beta2
+kind: Config
+metadata:
+  name: skaffold-demo
+build:
+  local:
+    concurrency: 2
+    push: true
+  tagPolicy:
+    inputDigest: {}
+  artifacts:
+    # Frontends:
+    - image: &frontendImage ghcr.io/nico151999/skaffold-demo-frontend
+      context: ./
+      docker:
+        dockerfile: ./frontend.Dockerfile
+      sync:
+        infer:
+          - "frontend/src/**/*"
+          - "frontend/static/**/*"
+    - image: &backendImage ghcr.io/nico151999/skaffold-demo-backend
+      context: ./
+      docker:
+        dockerfile: ./backend.Dockerfile
+test:
+  - context: .
+    structureTests:
+      - './structure-tests/*'
+    image: *backendImage
+  - custom:
+      - command: go test -v ./...
+    image: *backendImage
+deploy:
+  statusCheckDeadlineSeconds: 1200
+  helm:
+    flags:
+      install: ["--timeout", "20m"] # the initial image pulling can take quite a while depending on the internet connection
+      upgrade: ["--timeout", "15m"]
+    hooks:
+      before:
+        - host:
+            command:
+              - sh
+              - -c
+              - |
+                for varName in 'SKAFFOLD_DEMO_IMAGE_PULL_SECRET' 'SKAFFOLD_DEMO_IMAGE_PULL_SECRET_SERVER' 'SKAFFOLD_DEMO_IMAGE_PULL_SECRET_USERNAME' 'SKAFFOLD_DEMO_IMAGE_PULL_SECRET_PASSWORD'; do
+                  eval "var=\$$varName"
+                  if [ -z "$var" ]; then
+                    echo "$varName must not be blank" && exit 1
+                  fi
+                done
+                for ns in $(echo $SKAFFOLD_NAMESPACES | sed "s/,/ /g"); do
+                  kubectl create namespace $ns --dry-run=client -o yaml | kubectl apply -f - || exit 1
+                  kubectl create secret docker-registry "$SKAFFOLD_DEMO_IMAGE_PULL_SECRET" --save-config --docker-server="$SKAFFOLD_DEMO_IMAGE_PULL_SECRET_SERVER" --docker-username="$SKAFFOLD_DEMO_IMAGE_PULL_SECRET_USERNAME" --docker-password="$SKAFFOLD_DEMO_IMAGE_PULL_SECRET_PASSWORD" -n "$ns" --dry-run=client -o yaml | kubectl apply -f - || exit 1
+                done
+            os: [darwin, linux]
+            # TODO: create windows equivalent
+    releases:
+      - name: ingress-nginx
+        repo: "https://kubernetes.github.io/ingress-nginx"
+        remoteChart: "ingress-nginx"
+        namespace: "ingress-nginx"
+        createNamespace: true
+        version: 4.6.1
+        wait: false # TODO: find out why the installation times out when set to true
+        setValues:
+          controller:
+            podAnnotations:
+              "linkerd\\.io/inject": enabled
+            admissionWebhooks:
+              enabled: false
+            kind: DaemonSet
+            hostPort:
+              enabled: true
+              ports:
+                http: 80
+                https: 443
+      - name: skaffold-demo
+        chartPath: chart
+        namespace: skaffold-demo
+        createNamespace: true
+        setValueTemplates:
+          imagePullSecrets:
+            - name: "{{ .SKAFFOLD_DEMO_IMAGE_PULL_SECRET }}"
+          basePath: "/skaffold-demo"
+          frontend:
+            apiBaseURL: "http://{{ .SKAFFOLD_DEMO_BACKEND_HOST }}:8080"
+            ingress:
+              className: nginx
+              hosts:
+                - host: "{{ .SKAFFOLD_DEMO_FRONTEND_HOST }}"
+                  paths:
+                    - path: /
+                      pathType: ImplementationSpecific
+            image:
+              repository: *frontendImage
+              tag: *frontendImage
+          backend:
+            serverName: "Nico's backend"
+            ingress:
+              corsAllowOrigin: 'http://{{ .SKAFFOLD_DEMO_FRONTEND_HOST }}:8080'
+              className: nginx
+              hosts:
+                - host: "{{ .SKAFFOLD_DEMO_BACKEND_HOST }}"
+                  paths:
+                    - path: /
+                      pathType: ImplementationSpecific
+            image:
+              repository: *backendImage
+              tag: *backendImage
+profiles:
+  # NOTE: try to order profiles from last to first array element when removing; e.g. remove helm chart 2 before removing helm chart 1 to guarantee array index consistency
+  - name: DEV
+    activation:
+      - command: dev
+    patches:
+      - op: replace
+        path: /build/artifacts/0/docker/dockerfile
+        value: ./frontend.dev.Dockerfile
+      - op: replace
+        path: /build/local/push
+        value: false
+  - name: ALWAYS_PUSH_IMAGE
+    activation:
+      - env: SKAFFOLD_DEMO_IMAGE_PULL_SECRET=.+
+    patches:
+      - op: replace
+        path: /build/local/push
+        value: true
+  - name: SKIP_IMAGE_PULL_SECRET
+    activation:
+      - env: SKAFFOLD_DEMO_IMAGE_PULL_SECRET=
+      - env: SKAFFOLD_DEMO_IMAGE_PULL_SECRET_SERVER=
+      - env: SKAFFOLD_DEMO_IMAGE_PULL_SECRET_USERNAME=
+      - env: SKAFFOLD_DEMO_IMAGE_PULL_SECRET_PASSWORD=
+    patches:
+      - op: remove
+        path: /deploy/helm/hooks/before/0
+      - op: remove
+        path: /deploy/helm/releases/1/setValueTemplates/imagePullSecrets[0].name
+  - name: SKIP_SKAFFOLD_DEMO_INSTALLATION
+    activation:
+      - env: SKAFFOLD_DEMO_SKIP_SKAFFOLD_DEMO_INSTALLATION=true
+    patches:
+      - op: remove
+        path: /deploy/helm/releases/1
+  - name: SKIP_INGRESS_CONTROLLER_INSTALLATION
+    activation:
+      - env: SKAFFOLD_DEMO_SKIP_INGRESS_CONTROLLER_INSTALLATION=true
+    patches:
+      - op: remove
+        path: /deploy/helm/releases/0

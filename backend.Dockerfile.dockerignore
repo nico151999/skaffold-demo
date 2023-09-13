@@ -1,0 +1,13 @@
+/.git
+/charts
+/frontend
+/.gitignore
+/backend.Dockerfile
+/backend.Dockerfile.dockerignore
+/frontend.dev.Dockerfile
+/frontend.dev.Dockerfile.dockerignore
+/pnpm-workspace.yaml
+/pnpm-lock.yaml
+/skaffold.env
+/skaffold.env.dist
+/skaffold.yaml
